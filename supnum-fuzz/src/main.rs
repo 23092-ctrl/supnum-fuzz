@@ -41,11 +41,11 @@ struct Args {
     #[arg(short = 't', long, default_value_t = 100)]
     threads: usize,
 
-    /// Add random delay between requests (ms) for WAF evasion
+
     #[arg(long, default_value_t = 0)]
     jitter: u64,
 
-    /// Smart filter: Auto-detect 404 pages even if they return 200 OK
+  
     #[arg(long, default_value_t = false)]
     smart: bool,
 }
@@ -208,7 +208,7 @@ fn scan_url(ctx: Arc<AppContext>, base_url: String, current_depth: usize) -> Box
                  
                     let _permit = ctx.semaphore.acquire().await.unwrap();
 
-                    // Jitter (WAF Evasion)
+                   
                     if ctx.args.jitter > 0 {
                         let delay = rand::thread_rng().gen_range(0..ctx.args.jitter);
                         tokio::time::sleep(Duration::from_millis(delay)).await;
