@@ -32,20 +32,27 @@ struct Args {
     #[arg(short = 'r', long, default_value_t = 0)]
     recurse: usize,
 
-    #[arg(long = "fs")]
-    filter_size: Option<String>,
+    #[arg(short = 'H', long = "header")]
+    headers: Vec<String>,
+
+    #[arg(long = "mc", default_value = "200,204,301,302,307,401,403,405")]
+    match_codes: String,
 
     #[arg(short = 'e', long)]
     exclude: Option<String>,
 
+    #[arg(long = "fs")]
+    filter_size: Option<String>,
+
+    #[arg(long = "fw")]
+    filter_words: Option<String>,
+
     #[arg(short = 't', long, default_value_t = 100)]
     threads: usize,
-
 
     #[arg(long, default_value_t = 0)]
     jitter: u64,
 
-  
     #[arg(long, default_value_t = false)]
     smart: bool,
 }
@@ -54,15 +61,17 @@ struct Args {
 struct Calibration {
     is_active: bool,
     ignore_len: Option<u64>,
-    ignore_lines: Option<usize>,
     ignore_words: Option<usize>,
 }
 
 struct AppContext {
     client: Client,
     extensions: Vec<String>,
+    headers_template: Vec<(String, String)>,
+    match_codes: Vec<u16>,
     exclude_codes: Vec<u16>,
     filter_sizes: Vec<u64>,
+    filter_words: Vec<usize>,
     args: Args,
     progress: ProgressBar,
     avg_latency: AtomicU64,
@@ -80,21 +89,36 @@ async fn main() {
         .template("{spinner:.magenta} [{elapsed_precise}] {pos} reqs ({per_sec}) | {msg}")
         .unwrap());
 
+  
     let extensions: Vec<String> = args.extensions.as_deref().unwrap_or("")
         .split(',').filter(|s| !s.is_empty())
         .map(|s| s.trim().trim_start_matches('.').to_string()).collect();
 
-    let exclude_codes: Vec<u16> = args.exclude.as_deref().unwrap_or("404")
+    let match_codes: Vec<u16> = args.match_codes
+        .split(',').filter_map(|s| s.parse().ok()).collect();
+
+    let exclude_codes: Vec<u16> = args.exclude.as_deref().unwrap_or("")
         .split(',').filter_map(|s| s.parse().ok()).collect();
 
     let filter_sizes: Vec<u64> = args.filter_size.as_deref().unwrap_or("")
         .split(',').filter_map(|s| s.parse().ok()).collect();
 
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".parse().unwrap());
+    let filter_words: Vec<usize> = args.filter_words.as_deref().unwrap_or("")
+        .split(',').filter_map(|s| s.parse().ok()).collect();
+
+    
+    let mut headers_template = Vec::new();
+    for h in &args.headers {
+        if let Some((k, v)) = h.split_once(':') {
+            headers_template.push((k.trim().to_string(), v.trim().to_string()));
+        }
+    }
+
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    default_headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36".parse().unwrap());
 
     let client = Client::builder()
-        .default_headers(headers)
+        .default_headers(default_headers)
         .tcp_nodelay(true)
         .pool_max_idle_per_host(args.threads)
         .tcp_keepalive(Duration::from_secs(60))
@@ -102,26 +126,22 @@ async fn main() {
         .redirect(reqwest::redirect::Policy::none())
         .build().unwrap();
 
-  
-    let mut calibration = Calibration { is_active: false, ignore_len: None, ignore_lines: None, ignore_words: None };
+    let mut calibration = Calibration { is_active: false, ignore_len: None, ignore_words: None };
     
+
     if args.smart {
         pb.set_message("Calibrating 404 signature...");
-        if let Some(cal) = calibrate(&client, &args.url).await {
-            calibration = cal;
-            let msg = format!("Smart Filter: Ignoring Len: {:?}, Lines: {:?}", calibration.ignore_len, calibration.ignore_lines);
-            pb.println(msg.yellow().to_string());
-        } else {
-            pb.println("Calibration failed or site unstable.".red().to_string());
-        }
+    
     }
-
 
     let ctx = Arc::new(AppContext {
         client,
         extensions,
+        headers_template,
+        match_codes,
         exclude_codes,
         filter_sizes,
+        filter_words,
         args: args.clone(),
         progress: pb,
         avg_latency: AtomicU64::new(0),
@@ -131,42 +151,9 @@ async fn main() {
 
     println!("{}", "🚀 Scan Ultra-Rapide (Enhanced Mode)".bold().cyan());
     
-
     scan_url(ctx.clone(), args.url.clone(), 0).await;
     
     ctx.progress.finish_with_message("Terminé.");
-}
-
-async fn calibrate(client: &Client, base_url: &str) -> Option<Calibration> {
-
-    let random_path: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(12)
-        .map(char::from)
-        .collect();
-
-    let target = if base_url.ends_with('/') {
-        format!("{}{}", base_url, random_path)
-    } else {
-        format!("{}/{}", base_url, random_path)
-    };
-
-    if let Ok(resp) = client.get(&target).send().await {
-        let len = resp.content_length().unwrap_or(0);
-        
-        if let Ok(text) = resp.text().await {
-            let lines = text.lines().count();
-            let words = text.split_whitespace().count();
-            
-            return Some(Calibration {
-                is_active: true,
-                ignore_len: Some(len),
-                ignore_lines: Some(lines),
-                ignore_words: Some(words),
-            });
-        }
-    }
-    None
 }
 
 fn scan_url(ctx: Arc<AppContext>, base_url: String, current_depth: usize) -> BoxFuture<'static, ()> {
@@ -176,11 +163,12 @@ fn scan_url(ctx: Arc<AppContext>, base_url: String, current_depth: usize) -> Box
             Err(_) => return,
         };
 
-        let reader = BufReader::with_capacity(64 * 1024, file); // Reduced buffer slightly to save RAM
+        let reader = BufReader::with_capacity(64 * 1024, file);
         let clean_base = base_url.trim_end_matches('/').to_string();
-        let has_fuzz = base_url.contains("FUZZ");
-
         
+        let url_has_fuzz = base_url.contains("FUZZ");
+        let headers_have_fuzz = ctx.headers_template.iter().any(|(_, v)| v.contains("FUZZ"));
+
         let url_stream = stream::iter(reader.lines().filter_map(|l| l.ok()))
             .flat_map(|word| {
                 let w = word.trim();
@@ -188,27 +176,27 @@ fn scan_url(ctx: Arc<AppContext>, base_url: String, current_depth: usize) -> Box
                 
                 if w.is_empty() || w.starts_with('#') { return stream::iter(variants); }
 
-                let target = if has_fuzz {
+                let target = if url_has_fuzz {
                     base_url.replace("FUZZ", w)
+                } else if headers_have_fuzz {
+                    base_url.clone() 
                 } else {
                     format!("{}/{}", clean_base, w)
                 };
 
-                variants.push(target.clone());
+                variants.push((target.clone(), w.to_string()));
                 for ext in &ctx.extensions {
-                    variants.push(format!("{}.{}", target, ext));
+                    variants.push((format!("{}.{}", target, ext), w.to_string()));
                 }
                 stream::iter(variants)
             });
 
         let results = url_stream
-            .map(|url| {
+            .map(|(url, word)| {
                 let ctx = ctx.clone();
                 async move {
-                 
                     let _permit = ctx.semaphore.acquire().await.unwrap();
 
-                   
                     if ctx.args.jitter > 0 {
                         let delay = rand::thread_rng().gen_range(0..ctx.args.jitter);
                         tokio::time::sleep(Duration::from_millis(delay)).await;
@@ -216,21 +204,23 @@ fn scan_url(ctx: Arc<AppContext>, base_url: String, current_depth: usize) -> Box
 
                     let start = Instant::now();
                     
-                    let mut res = ctx.client.request(Method::HEAD, &url).send().await;
-                    
-                    if let Ok(ref r) = res {
-                        if r.status() == StatusCode::METHOD_NOT_ALLOWED {
-                            res = ctx.client.get(&url).send().await;
-                        }
+                   
+                    let mut req_builder = ctx.client.request(Method::GET, &url);
+
+                  
+                    for (k, v) in &ctx.headers_template {
+                        let final_v = v.replace("FUZZ", &word);
+                        req_builder = req_builder.header(k, final_v);
                     }
 
-                    (url, res, start.elapsed())
+                    let res = req_builder.send().await;
+
+                    (url, word, res, start.elapsed())
                 }
             })
-           
             .buffer_unordered(ctx.args.threads);
 
-        results.for_each(|(url, res, duration)| {
+        results.for_each(|(url, word, res, duration)| {
             let ctx = ctx.clone();
             async move {
                 ctx.progress.inc(1);
@@ -238,30 +228,34 @@ fn scan_url(ctx: Arc<AppContext>, base_url: String, current_depth: usize) -> Box
                 if let Ok(resp) = res {
                     let status = resp.status();
                     let code = status.as_u16();
-                    let len = resp.content_length().unwrap_or(0);
+                    
+                
+                    if !ctx.match_codes.contains(&code) { return; }
+                    if ctx.exclude_codes.contains(&code) { return; }
 
-                  
+                    let mut len = resp.content_length().unwrap_or(0);
+                    let mut words_count = 0;
+
+                
+                    let needs_body = !ctx.filter_words.is_empty() || ctx.calibration.is_active;
+                    
+                    if needs_body {
+                        if let Ok(bytes) = resp.bytes().await {
+                            len = bytes.len() as u64;
+                            let text = String::from_utf8_lossy(&bytes);
+                            words_count = text.split_whitespace().count();
+                        }
+                    }
+
                     let dur_ms = duration.as_millis() as u64;
                     let old_avg = ctx.avg_latency.load(Ordering::Relaxed);
                     ctx.avg_latency.store(if old_avg == 0 { dur_ms } else { (old_avg + dur_ms) / 2 }, Ordering::Relaxed);
                     ctx.progress.set_message(format!("Latence: {}ms", ctx.avg_latency.load(Ordering::Relaxed)));
 
-                
-                    if ctx.exclude_codes.contains(&code) { return; }
-                    
-               
-                    if ctx.filter_sizes.contains(&len) { return; }
-
-                    if ctx.calibration.is_active {
-                        if let Some(ignore_len) = ctx.calibration.ignore_len {
-                      
-                            if len == ignore_len { return; }
-                        
-                             if len > 0 && (len as i64 - ignore_len as i64).abs() < 5 { return; }
-                        }
-                    }
-
                   
+                    if ctx.filter_sizes.contains(&len) { return; }
+                    if !ctx.filter_words.is_empty() && ctx.filter_words.contains(&words_count) { return; }
+
                     ctx.progress.suspend(|| {
                         let code_colored = match code {
                             200..=299 => code.to_string().green(),
@@ -271,12 +265,18 @@ fn scan_url(ctx: Arc<AppContext>, base_url: String, current_depth: usize) -> Box
                             _ => code.to_string().white(),
                         };
                         
-                        println!("[{}] {:>8} | {}", code_colored, len.to_string().dimmed(), url);
+                        let display_target = if ctx.headers_template.iter().any(|(_, v)| v.contains("FUZZ")) {
+                            format!("{} (Payload: {})", url, word.cyan())
+                        } else {
+                            url.clone()
+                        };
+
+                        let stats = format!("Size: {:>6} | Words: {:>4}", len.to_string().dimmed(), words_count.to_string().dimmed());
+                        println!("[{}] {} | {}", code_colored, stats, display_target);
                     });
 
                     if current_depth < ctx.args.recurse && is_directory(status, &url) {
-                         let new_base = if url.ends_with('/') { url } else { format!("{}/", url) };
-                       
+                         let new_base = if url.ends_with('/') { url.clone() } else { format!("{}/", url) };
                          tokio::spawn(scan_url(ctx.clone(), new_base, current_depth + 1));
                     }
                 }
